@@ -44,8 +44,7 @@ func (c *Catalog) CheckIndex(i Index) error {
 func (c *Catalog) List() []Relation {
 	out := make([]Relation, 0, len(c.Relations))
 	for _, r := range c.Relations {
-		r.Columns = append([]Column(nil), r.Columns...)
-		out = append(out, r)
+		out = append(out, r.Clone())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -60,11 +59,20 @@ func (c *Catalog) IndexList() []Index {
 }
 func (c *Catalog) Clone() *Catalog {
 	n := New()
-	for _, r := range c.List() {
-		n.Relations[r.Name] = r
+	for name, r := range c.Relations {
+		n.Relations[name] = r.Clone()
 	}
 	for k, v := range c.Indexes {
 		n.Indexes[k] = v
 	}
 	return n
+}
+
+// MigrateLegacy upgrades every pre-evolution relation (no revision chain) to
+// carry its synthesized revision 0. It is idempotent.
+func (c *Catalog) MigrateLegacy() {
+	for name, r := range c.Relations {
+		r.MigrateLegacy()
+		c.Relations[name] = r
+	}
 }

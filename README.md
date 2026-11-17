@@ -40,6 +40,27 @@ curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' 
 
 `put` 是完整行替换；缺失的可空列补为 null，缺失的非空列拒绝。主键从新行中取得，不提供原主键重命名操作。删除接口为事务 URL 下的 `delete`，正文为 `{"relation":"spectra","key":1}`；不存在的键也可以形成墓碑。DDL 自身是单个耐久操作，不在用户事务中暂存。
 
+## 受控模式演进
+
+已存在的关系可以在不新建表、不重写历史行的情况下演进模式。每次演进都是一条独立、耐久、原子的日志记录（记录类型 `evolution`），在某个提交序号生效；同一关系入口继续服务旧数据和新数据。
+
+```sh
+curl -s http://127.0.0.1:7386/v1/lamina/relations/spectra/evolve -H 'Content-Type: application/json' -d '{"changes":[
+  {"op":"add_column","name":"note","type":"text"},
+  {"op":"add_column","name":"score","type":"int","nullable":false,"default":0},
+  {"op":"alter_column","name":"band","default":"unknown"},
+  {"op":"drop_column","name":"note"}
+]}'
+```
+
+`op` 取值 `add_column`、`alter_column`、`drop_column`，一次请求可包含多个变更，它们共同形成一个新模式世代（revision）。
+
+- **允许的兼容调整**：新增可空列；新增带类型默认值的非空列（旧行按默认解释，不重写存储字节）；修改可空列的默认值（显式 `"default":null` 清除默认）；删除非主键、未被索引引用的列。
+- **被拒绝的不兼容调整（409，且不消耗提交序号）**：改变列类型、收紧或放宽可空性、删除或改动主键、删除被索引引用的列、重新使用曾经删除的列名（该列名进入 `retired`，因为旧行里它曾代表另一种含义）。
+- **世代与快照绑定**：每个关系保存按生效序号排列的 `revisions`。查询按其快照序号绑定当时有效的世代——长事务和 `at` 历史读继续用旧世代解释旧行，看不到后来新增的列；当前读把旧行投影到新世代，新增列用该世代的默认值补齐。演进开始后仍在运行的旧事务若尝试写入该关系，会收到 409 并要求以新目录重启事务，旧行不会被悄悄换一种类型解释。
+- **回收边界**：`vacuum` 在回收行版本的同时，回收不再被任何保留行版本或保留快照引用的旧世代；世代序号（ordinal）保持单调、允许不连续。一旦某世代被回收，低于回收水位的历史读按既有规则返回 410。`GET /relations/{name}` 返回完整世代时间线与 `retired` 列表，`GET /stats` 的 `schemas` 字段汇总每个关系保留的世代数和最早世代序号。
+- **耐久与还原**：世代链、每行写入时绑定的 `schema_ordinal` 都进入日志和备份图像；纯日志重放、检查点恢复、备份还原都会保留“同一行在不同快照下按不同世代解释”的区别，旧版本数据目录会在打开时自动补上初始世代。
+
 ## 查询与隔离
 
 `POST /query` 接收 `relation`、`columns`、`where`、`order`、`limit`，以及可选的 `transaction` 或 `at`。两种快照选择互斥。`where` 是 AND 连接的比较，支持 `= != < <= > >= is_null not_null`；`order` 指定列及 `desc`。

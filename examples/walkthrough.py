@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','schema-evolution']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -152,6 +152,77 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='schema-evolution':
+    # Dedicated relation so the evolution timeline is self-contained.
+    s.call('POST','/relations',{'name':'tracks','primary':'id','columns':[{'name':'id','type':'int'},{'name':'title','type':'text'}]},201)
+    t0=s.begin()
+    s.call('POST',f'/transactions/{t0}/put',{'relation':'tracks','row':{'id':1,'title':'alpha'}},200)
+    s.call('POST',f'/transactions/{t0}/put',{'relation':'tracks','row':{'id':2,'title':'beta'}},200)
+    born=s.commit(t0)['sequence']
+    # A long reader and a long writer open before any evolution.
+    old=s.begin(True)
+    writer=s.begin()
+    # Additive + default evolution is one durable, atomic record.
+    ev=s.call('POST','/relations/tracks/evolve',{'changes':[
+      {'op':'add_column','name':'note','type':'text'},
+      {'op':'add_column','name':'score','type':'int','nullable':False,'default':0},
+      {'op':'alter_column','name':'title','default':'untitled'}]},200)
+    require(ev['ordinal']==1 and ev['effective_at']==ev['sequence'],'evolution boundary not reported')
+    before=s.stats()['sequence']
+    # Incompatible adjustments are rejected and consume no sequence.
+    s.call('POST','/relations/tracks/evolve',{'changes':[{'op':'alter_column','name':'score','type':'text'}]},409)
+    s.call('POST','/relations/tracks/evolve',{'changes':[{'op':'alter_column','name':'score','nullable':True}]},409)
+    require(s.stats()['sequence']==before,'rejected evolution advanced the sequence')
+    # Old snapshot keeps the original interpretation; current reads project defaults.
+    old_rows=s.call('POST','/query',{'relation':'tracks','transaction':old})
+    require('score' not in old_rows['rows'][0],'old snapshot re-interpreted under new schema')
+    cur=s.call('POST','/query',{'relation':'tracks'})
+    require(all(r['score']==0 and 'note' in r for r in cur['rows']),'new schema did not project defaults onto old rows')
+    # A pre-evolution writer cannot publish under a schema it never saw.
+    s.call('POST',f'/transactions/{writer}/put',{'relation':'tracks','row':{'id':9,'title':'z'}},409)
+    s.call('POST',f'/transactions/{writer}/rollback')
+    # New writes enter through the same relation under the current schema.
+    t1=s.begin()
+    s.call('POST',f'/transactions/{t1}/put',{'relation':'tracks','row':{'id':3,'title':'gamma','score':42}},200)
+    s.commit(t1)
+    grown=s.call('POST','/query',{'relation':'tracks','where':[{'column':'id','op':'=','value':3}]})['rows'][0]
+    require(grown['score']==42,'post-evolution write not read back')
+    # Time travel to the pre-evolution sequence still binds the old schema.
+    hist=s.call('POST','/query',{'relation':'tracks','at':born})
+    require('score' not in hist['rows'][0] and len(hist['rows'])==2,'historical snapshot schema binding lost')
+    # Drop a column, then prove its name can never be reused.
+    s.call('POST','/relations/tracks/evolve',{'changes':[{'op':'drop_column','name':'note'}]},200)
+    s.call('POST','/relations/tracks/evolve',{'changes':[{'op':'add_column','name':'note','type':'text'}]},409)
+    detail=s.call('GET','/relations/tracks')
+    require(detail['retired']==['note'],'retired column list mismatch')
+    # The change feed exposes the evolution boundary records.
+    feed=s.call('GET',f'/changes?after={born}&limit=100')
+    kinds=[r['kind'] for r in feed['records']]
+    require('evolution' in kinds,'evolution missing from change feed')
+    # Vacuum is pinned while the long reader lives; after it closes, old
+    # revisions and row versions are reclaimed and stale reads go 410.
+    head=s.stats()['sequence']
+    pinned=s.call('POST','/vacuum',{'horizon':head})
+    require(pinned['pinned'],'active reader did not pin retention')
+    s.call('POST',f'/transactions/{old}/rollback')
+    s.call('POST','/vacuum',{'horizon':head})
+    s.call('POST','/query',{'relation':'tracks','at':born},410)
+    pruned=s.call('GET','/relations/tracks')
+    ordinals=[v['ordinal'] for v in pruned['revisions']]
+    require(ordinals==sorted(set(ordinals)) and ordinals[0]==0,'revision chain not monotonic after pruning')
+    # A later evolution keeps ordinals monotonic across the pruned gap.
+    again=s.call('POST','/relations/tracks/evolve',{'changes':[{'op':'add_column','name':'flag','type':'bool'}]},200)
+    require(again['ordinal']>max(ordinals),'ordinal regressed after vacuum')
+    # Checkpoint + restart preserves the timeline and row interpretation.
+    s.call('POST','/checkpoint')
+    s.stop();s.start()
+    after=s.call('POST','/query',{'relation':'tracks'})
+    require(len(after['rows'])==3 and all('flag' in r for r in after['rows']),'restart lost evolved schema or data')
+    restored=s.call('GET','/relations/tracks')
+    require([v['ordinal'] for v in restored['revisions']][-1]==again['ordinal'],'revision ordinal not durable')
+    observations={'evolution':ev,'current_ordinals':[v['ordinal'] for v in restored['revisions']],
+                  'old_snapshot_columns':sorted(old_rows['rows'][0].keys()),
+                  'current_columns':sorted(after['rows'][0].keys()),'retired':restored['retired']}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

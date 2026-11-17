@@ -6,7 +6,7 @@ import (
 	"lamina/internal/datum"
 )
 
-func Bind(r catalog.Relation, q Request) error {
+func Bind(r catalog.RelationView, q Request) error {
 	if q.Limit < 0 || q.Limit > 10000 {
 		return fmt.Errorf("limit must be 0..10000")
 	}

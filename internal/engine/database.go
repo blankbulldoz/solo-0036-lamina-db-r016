@@ -49,6 +49,7 @@ func Open(dir string) (*DB, error) {
 	}
 	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
 	if !missing {
+		image.Catalog.MigrateLegacy()
 		d.catalog = image.Catalog
 		d.store = image.Store
 		d.sequence = image.Sequence
@@ -118,4 +119,19 @@ func (d *DB) Relations() ([]catalog.Relation, []catalog.Index, error) {
 		return nil, nil, err
 	}
 	return d.catalog.List(), d.catalog.IndexList(), nil
+}
+
+// RelationDetail exposes the full schema-evolution timeline of one relation,
+// including which generations are still retained for historical reads.
+func (d *DB) RelationDetail(name string) (catalog.Relation, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if err := d.usable(); err != nil {
+		return catalog.Relation{}, err
+	}
+	r, err := d.catalog.Relation(name)
+	if err != nil {
+		return catalog.Relation{}, invalid(err)
+	}
+	return r.Clone(), nil
 }

@@ -72,6 +72,7 @@ func Validate(image Image) error {
 	if image.Format != 1 || image.Horizon > image.Sequence || image.Catalog == nil || image.Store == nil || image.Catalog.Relations == nil || image.Catalog.Indexes == nil || image.Store.Tables == nil {
 		return fmt.Errorf("invalid image header")
 	}
+	image.Catalog.MigrateLegacy()
 	for name, r := range image.Catalog.Relations {
 		if name != r.Name || r.Created == 0 || r.Created > image.Sequence {
 			return fmt.Errorf("invalid catalog sequence")
@@ -105,8 +106,12 @@ func Validate(image Image) error {
 				}
 				last = v.Sequence
 				if !v.Deleted {
-					row, err := r.Normalize(v.Row)
-					if err != nil || r.Key(row) != key {
+					view, ok := storedView(r, v.SchemaOrdinal, v.Sequence)
+					if !ok {
+						return fmt.Errorf("row references missing schema revision %d", v.SchemaOrdinal)
+					}
+					row, err := catalog.Normalize(view, v.Row)
+					if err != nil || view.Key(row) != key {
 						return fmt.Errorf("invalid stored tuple")
 					}
 				}
@@ -117,13 +122,16 @@ func Validate(image Image) error {
 		if !definition.Unique {
 			continue
 		}
+		relation := image.Catalog.Relations[definition.Relation]
+		view := relation.CurrentView()
 		seen := map[string]bool{}
 		for _, chain := range image.Store.Tables[definition.Relation] {
 			version, exists := versions.Visible(chain, image.Sequence)
 			if !exists {
 				continue
 			}
-			value := version.Row[definition.Column]
+			row := catalog.Project(view, version.Row)
+			value := row[definition.Column]
 			if value.Null() {
 				continue
 			}
@@ -135,4 +143,18 @@ func Validate(image Image) error {
 	}
 
 	return nil
+}
+
+// storedView resolves the schema generation that explains a stored row.
+func storedView(relation catalog.Relation, ordinal int, sequence uint64) (catalog.RelationView, bool) {
+	if ordinal == 0 {
+		if view, ok := relation.ViewAt(sequence); ok {
+			return view, true
+		}
+	}
+	rev, ok := relation.Revision(ordinal)
+	if !ok {
+		return catalog.RelationView{}, false
+	}
+	return relation.ViewAt(rev.EffectiveAt)
 }

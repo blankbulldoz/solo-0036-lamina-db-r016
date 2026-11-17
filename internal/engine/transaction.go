@@ -3,6 +3,7 @@ package engine
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"lamina/internal/catalog"
 	"lamina/internal/datum"
 	"lamina/internal/journal"
 	"lamina/internal/versions"
@@ -72,11 +73,21 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 	if r.Created > tx.Snapshot {
 		return fault("conflict", "relation outside transaction catalog snapshot")
 	}
-	normalized, err := r.Normalize(row)
+	// A transaction reads and writes under the schema generation pinned at its
+	// start snapshot; an evolution published in the meantime cannot silently
+	// re-interpret its rows. The transaction must be restarted.
+	view, ok := r.ViewAt(tx.Snapshot)
+	if !ok {
+		return fault("conflict", "relation schema outside transaction catalog snapshot")
+	}
+	if view.Ordinal != r.CurrentView().Ordinal {
+		return fault("conflict", "relation %s evolved after transaction snapshot; restart the transaction", table)
+	}
+	normalized, err := catalog.Normalize(view, row)
 	if err != nil {
 		return invalid(err)
 	}
-	key := r.Key(normalized)
+	key := view.Key(normalized)
 	rows := d.store.Scan(table, tx.Snapshot)
 	overlay(rows, tx.writes, table)
 	if insertOnly {
@@ -90,7 +101,8 @@ func (d *DB) Put(id, table string, row datum.Row, insertOnly bool) error {
 	if err = tx.reserve(table, key); err != nil {
 		return err
 	}
-	tx.writes[table][key] = staged{Mutation: versions.Mutation{Relation: table, Key: key, Row: normalized}, InsertOnly: insertOnly}
+	mutation := versions.Mutation{Relation: table, Key: key, Row: normalized, SchemaOrdinal: view.Ordinal}
+	tx.writes[table][key] = staged{Mutation: mutation, InsertOnly: insertOnly}
 	return nil
 }
 func (tx *Transaction) reserve(table, key string) error {
@@ -126,7 +138,14 @@ func (d *DB) Delete(id, table string, value datum.Value) error {
 	if r.Created > tx.Snapshot {
 		return fault("conflict", "relation outside transaction catalog snapshot")
 	}
-	col, _ := r.Column(r.Primary)
+	view, ok := r.ViewAt(tx.Snapshot)
+	if !ok {
+		return fault("conflict", "relation schema outside transaction catalog snapshot")
+	}
+	if view.Ordinal != r.CurrentView().Ordinal {
+		return fault("conflict", "relation %s evolved after transaction snapshot; restart the transaction", table)
+	}
+	col := view.PrimaryColumn()
 	if value.Null() || value.Kind != col.Type {
 		return fault("invalid", "invalid primary value")
 	}

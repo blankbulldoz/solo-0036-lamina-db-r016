@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"lamina/internal/catalog"
 	"lamina/internal/datum"
 	"lamina/internal/query"
 )
@@ -32,10 +33,11 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 	if at < d.horizon || at > d.sequence {
 		return query.Result{}, fault("snapshot", "snapshot unavailable; retained interval %d..%d", d.horizon, d.sequence)
 	}
-	if at < r.Created {
+	view, ok := r.ViewAt(at)
+	if !ok {
 		return query.Result{}, fault("snapshot", "relation did not exist at snapshot")
 	}
-	if err = query.Bind(r, q); err != nil {
+	if err = query.Bind(view, q); err != nil {
 		return query.Result{}, invalid(err)
 	}
 	if tx != nil && len(tx.writes[q.Relation]) > 0 {
@@ -45,23 +47,26 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 	rows := map[string]datum.Row{}
 	if plan.Access == "index" {
 		for _, key := range keys {
-			if row, exists := d.store.Read(q.Relation, key, at); exists {
-				rows[key] = row
+			if raw, exists := d.store.Read(q.Relation, key, at); exists {
+				rows[key] = catalog.Project(view, raw)
 			}
 		}
 	} else {
-		rows = d.store.Scan(q.Relation, at)
+		for key, raw := range d.store.Scan(q.Relation, at) {
+			rows[key] = catalog.Project(view, raw)
+		}
 	}
 	if tx != nil {
 		overlay(rows, tx.writes, q.Relation)
 	}
-	result, err := query.Execute(r, q, rows, plan, keys)
+	result, err := query.Execute(view, q, rows, plan, keys)
 	d.queries++
 	if err != nil {
 		return result, invalid(err)
 	}
 	return result, nil
 }
+
 func (d *DB) Get(id, table string, key datum.Value) (datum.Row, error) {
 	q := query.Request{Relation: table, Transaction: id, Limit: 1}
 	d.mu.RLock()
@@ -70,7 +75,7 @@ func (d *DB) Get(id, table string, key datum.Value) (datum.Row, error) {
 	if err != nil {
 		return nil, invalid(err)
 	}
-	col, _ := r.Column(r.Primary)
+	col := r.CurrentView().PrimaryColumn()
 	if key.Null() || key.Kind != col.Type {
 		return nil, fault("invalid", "invalid primary value")
 	}

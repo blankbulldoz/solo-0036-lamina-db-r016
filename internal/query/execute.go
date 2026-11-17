@@ -8,7 +8,7 @@ import (
 	"sort"
 )
 
-func Execute(r catalog.Relation, q Request, rows map[string]datum.Row, plan Plan, keys []string) (Result, error) {
+func Execute(r catalog.RelationView, q Request, rows map[string]datum.Row, plan Plan, keys []string) (Result, error) {
 	result := Result{Rows: []datum.Row{}, Plan: plan}
 	if plan.Access == "scan" {
 		keys = datum.Keys(rows)

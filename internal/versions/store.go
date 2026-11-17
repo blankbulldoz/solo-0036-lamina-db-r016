@@ -7,11 +7,15 @@ type Mutation struct {
 	Key      string    `json:"key"`
 	Row      datum.Row `json:"row,omitempty"`
 	Deleted  bool      `json:"deleted,omitempty"`
+	// SchemaOrdinal is the catalog revision that normalized Row. Zero means
+	// the pre-evolution baseline shape and is resolved from the row sequence.
+	SchemaOrdinal int `json:"schema_ordinal,omitempty"`
 }
 type Version struct {
-	Sequence uint64    `json:"sequence"`
-	Row      datum.Row `json:"row,omitempty"`
-	Deleted  bool      `json:"deleted,omitempty"`
+	Sequence      uint64    `json:"sequence"`
+	Row           datum.Row `json:"row,omitempty"`
+	Deleted       bool      `json:"deleted,omitempty"`
+	SchemaOrdinal int       `json:"schema_ordinal,omitempty"`
 }
 type Store struct {
 	Tables map[string]map[string][]Version `json:"tables"`
@@ -26,8 +30,24 @@ func (s *Store) Ensure(name string) {
 func (s *Store) Apply(seq uint64, writes []Mutation) {
 	for _, m := range writes {
 		s.Ensure(m.Relation)
-		s.Tables[m.Relation][m.Key] = append(s.Tables[m.Relation][m.Key], Version{Sequence: seq, Row: datum.Clone(m.Row), Deleted: m.Deleted})
+		s.Tables[m.Relation][m.Key] = append(s.Tables[m.Relation][m.Key], Version{Sequence: seq, Row: datum.Clone(m.Row), Deleted: m.Deleted, SchemaOrdinal: m.SchemaOrdinal})
 	}
+}
+
+// ReferencedSchemaOrdinals reports which schema generations still explain a
+// retained row version in the store, keyed by relation.
+func (s *Store) ReferencedSchemaOrdinals() map[string]map[int]bool {
+	out := map[string]map[int]bool{}
+	for name, rows := range s.Tables {
+		refs := map[int]bool{}
+		for _, chain := range rows {
+			for _, v := range chain {
+				refs[v.SchemaOrdinal] = true
+			}
+		}
+		out[name] = refs
+	}
+	return out
 }
 func Visible(chain []Version, at uint64) (Version, bool) {
 	lo, hi := 0, len(chain)
